@@ -1,0 +1,307 @@
+"""
+Corptax Account Consolidator (Streamlit)
+
+Run:
+    pip install streamlit pandas openpyxl
+    streamlit run corptax_consolidator.py
+
+Upload up to 5 (or more) CSV/Excel tables that share the same structure:
+    Corptax Account Key (primary key), Corp Tax Account, ITD Balance Amount,
+    Book Reclass, Tax Adjustments, Amount as per Schedule L/Page 1
+"""
+
+import csv
+import io
+import re
+
+import pandas as pd
+import streamlit as st
+from openpyxl.utils.cell import column_index_from_string, coordinate_from_string
+
+KEY = "Corptax Account Key"
+NAME = "Corp Tax Account"
+NUM_COLS = [
+    "ITD Balance Amount",
+    "Book Reclass",
+    "Tax Adjustments",
+    "Amount as per Schedule L/Page 1",
+]
+
+# Header matching ignores case, spaces and punctuation, so minor naming
+# differences between the 5 tables don't break anything.
+ALIASES = {
+    "corptaxaccountkey": KEY,
+    "corptaxacctkey": KEY,
+    "corptaxaccount": NAME,
+    "corptaxacct": NAME,
+    "itdbalanceamount": NUM_COLS[0],
+    "itdbalance": NUM_COLS[0],
+    "bookreclass": NUM_COLS[1],
+    "taxadjustments": NUM_COLS[2],
+    "amountasperschedulelpage1": NUM_COLS[3],
+    "amountasperschedulel": NUM_COLS[3],
+}
+
+
+def norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+
+def to_number(series: pd.Series) -> pd.Series:
+    """Handles '1,234.50', '(1,234.50)' negatives, '$', blanks, '-'."""
+    if pd.api.types.is_numeric_dtype(series):
+        return series.fillna(0)
+    s = series.astype(str).str.strip()
+    neg = s.str.match(r"^\(.*\)$")
+    s = s.str.replace(r"[,$()\s]", "", regex=True).replace({"": None, "-": None, "nan": None})
+    out = pd.to_numeric(s, errors="coerce").fillna(0)
+    return out.where(~neg, -out)
+
+
+def read_raw_grid(file, sheet=None) -> pd.DataFrame:
+    """Read the whole sheet/CSV as a raw grid of strings (no header handling)."""
+    file.seek(0)
+    if file.name.lower().endswith((".xlsx", ".xlsm", ".xls")):
+        return pd.read_excel(file, sheet_name=sheet or 0, header=None, dtype=str)
+    text = file.read().decode("utf-8-sig", errors="replace")
+    rows = list(csv.reader(io.StringIO(text)))
+    width = max((len(r) for r in rows), default=0)
+    return pd.DataFrame([r + [None] * (width - len(r)) for r in rows]).replace({"": None})
+
+
+def read_table(file, sheet=None, start_cell: str = "") -> pd.DataFrame:
+    """Extract one table from a sheet that has other data around it.
+
+    start_cell: Excel-style reference (e.g. 'C14') of the 'Corptax Account Key'
+    header cell. If blank, the sheet is scanned for that header automatically.
+    The table runs right from that cell until the first empty header cell, and
+    down until the first row with an empty key.
+    """
+    grid = read_raw_grid(file, sheet)
+
+    start_cell = (start_cell or "").strip().upper()
+    if start_cell:
+        try:
+            col_letter, row_num = coordinate_from_string(start_cell)
+            r, c = row_num - 1, column_index_from_string(col_letter) - 1
+        except Exception:
+            raise ValueError(f"'{start_cell}' is not a valid cell reference (try something like C14).")
+        if r >= len(grid) or c >= grid.shape[1]:
+            raise ValueError(f"Cell {start_cell} is outside the data in this sheet.")
+        if ALIASES.get(norm(grid.iat[r, c])) != KEY:
+            found = grid.iat[r, c]
+            raise ValueError(
+                f"Cell {start_cell} contains {found!r}, expected the '{KEY}' header."
+            )
+    else:
+        hits = [
+            (i, j)
+            for i in range(len(grid))
+            for j in range(grid.shape[1])
+            if ALIASES.get(norm(grid.iat[i, j])) == KEY
+        ]
+        if not hits:
+            raise ValueError(
+                f"Could not find a '{KEY}' header anywhere. Enter its cell (e.g. C14) in the sidebar."
+            )
+        r, c = hits[0]
+
+    # Header: contiguous non-empty cells going right from the key header.
+    header = []
+    j = c
+    while j < grid.shape[1] and pd.notna(grid.iat[r, j]) and str(grid.iat[r, j]).strip():
+        header.append(str(grid.iat[r, j]).strip())
+        j += 1
+
+    # Body: go down until the key cell is empty.
+    end = r + 1
+    while end < len(grid) and pd.notna(grid.iat[end, c]) and str(grid.iat[end, c]).strip():
+        end += 1
+
+    body = grid.iloc[r + 1 : end, c : c + len(header)].copy()
+    body.columns = header
+    return body.reset_index(drop=True)
+
+
+def prepare(df: pd.DataFrame, label: str):
+    """Standardise columns, clean values, aggregate to one row per key.
+    Returns (clean_df, warnings, duplicate_key_count)."""
+    warnings = []
+    df = df.rename(columns={c: ALIASES.get(norm(c), c) for c in df.columns})
+
+    if KEY not in df.columns:
+        raise ValueError(f"'{label}': column '{KEY}' not found. Found: {list(df.columns)}")
+
+    if NAME not in df.columns:
+        df[NAME] = pd.NA
+        warnings.append(f"{label}: '{NAME}' column missing")
+    for c in NUM_COLS:
+        if c not in df.columns:
+            df[c] = 0
+            warnings.append(f"{label}: '{c}' column missing, treated as 0")
+
+    df = df[[KEY, NAME] + NUM_COLS].copy()
+    df[KEY] = df[KEY].astype(str).str.strip()
+    df = df[~df[KEY].isin(["", "nan", "None"])]
+    df[NAME] = df[NAME].astype("string").str.strip()
+    for c in NUM_COLS:
+        df[c] = to_number(df[c])
+
+    dup_count = int(df[KEY].duplicated().sum())
+    if dup_count:
+        warnings.append(f"{label}: {dup_count} duplicate key row(s) found, amounts were summed")
+
+    agg = df.groupby(KEY, as_index=False).agg(
+        {NAME: "first", **{c: "sum" for c in NUM_COLS}}
+    )
+    return agg, warnings, dup_count
+
+
+def consolidate_sum(tables: dict) -> pd.DataFrame:
+    stacked = pd.concat([t.assign(Source=label) for label, t in tables.items()], ignore_index=True)
+    out = stacked.groupby(KEY, as_index=False).agg(
+        {
+            NAME: "first",
+            **{c: "sum" for c in NUM_COLS},
+            "Source": lambda s: ", ".join(s),
+        }
+    )
+    out = out.rename(columns={"Source": "Found In Tables"})
+    out["Tables Count"] = out["Found In Tables"].str.count(",") + 1
+    return out
+
+
+def consolidate_side_by_side(tables: dict) -> pd.DataFrame:
+    merged = None
+    for label, t in tables.items():
+        t = t.rename(columns={c: f"{c} [{label}]" for c in NUM_COLS + [NAME]})
+        merged = t if merged is None else merged.merge(t, on=KEY, how="outer")
+
+    name_cols = [c for c in merged.columns if c.startswith(NAME)]
+    merged.insert(1, NAME, merged[name_cols].bfill(axis=1).iloc[:, 0])
+    merged = merged.drop(columns=name_cols)
+
+    for c in NUM_COLS:
+        src = [col for col in merged.columns if col.startswith(f"{c} [")]
+        merged[f"{c} [TOTAL]"] = merged[src].fillna(0).sum(axis=1)
+    return merged
+
+
+def name_conflicts(tables: dict) -> pd.DataFrame:
+    stacked = pd.concat([t.assign(Source=l) for l, t in tables.items()], ignore_index=True)
+    stacked = stacked.dropna(subset=[NAME])
+    g = stacked.groupby(KEY)[NAME].agg(lambda s: sorted(set(s)))
+    g = g[g.apply(len) > 1]
+    return g.reset_index().rename(columns={NAME: "Different Names Found"}).astype(str)
+
+
+def to_excel_bytes(sheets: dict) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        for name, df in sheets.items():
+            df.to_excel(writer, sheet_name=name[:31], index=False)
+    return buf.getvalue()
+
+
+# ----------------------------- UI -----------------------------
+st.set_page_config(page_title="Corptax Consolidator", layout="wide")
+st.title("Corptax Account Consolidator")
+st.caption(f"Combine multiple tables keyed on **{KEY}** into one.")
+
+files = st.file_uploader(
+    "Upload your tables (CSV or Excel)",
+    type=["csv", "xlsx", "xlsm", "xls"],
+    accept_multiple_files=True,
+)
+
+mode = st.radio(
+    "Consolidation mode",
+    ["Sum by key (one row per key)", "Side by side (per-table columns + totals)"],
+    help="Sum: stacks all tables and adds amounts for matching keys. "
+    "Side by side: keeps each table's amounts in separate columns so you can trace sources.",
+)
+
+if not files:
+    st.info("Upload your 5 tables to begin.")
+    st.stop()
+
+tables, all_warnings, raw_counts = {}, [], {}
+for i, f in enumerate(files):
+    label = st.sidebar.text_input(f"Label for {f.name}", value=f"T{i + 1}", key=f"label{i}")
+    sheet = None
+    if f.name.lower().endswith((".xlsx", ".xlsm", ".xls")):
+        names = pd.ExcelFile(f).sheet_names
+        if len(names) > 1:
+            sheet = st.sidebar.selectbox(f"Sheet for {f.name}", names, key=f"sheet{i}")
+        f.seek(0)
+    start_cell = st.sidebar.text_input(
+        f"Start cell for {f.name}",
+        value="",
+        placeholder="e.g. C14 (blank = auto-detect)",
+        help=f"Cell holding the '{KEY}' column header. Leave blank to auto-find it.",
+        key=f"start{i}",
+    )
+    try:
+        raw = read_table(f, sheet, start_cell)
+        raw_counts[label] = len(raw)
+        clean, warns, _ = prepare(raw, label)
+        tables[label] = clean
+        all_warnings += warns
+    except Exception as e:
+        st.error(str(e))
+        st.stop()
+
+if len(set(tables)) != len(tables):
+    st.error("Table labels must be unique (edit them in the sidebar).")
+    st.stop()
+
+result = consolidate_sum(tables) if mode.startswith("Sum") else consolidate_side_by_side(tables)
+
+# Summary
+c1, c2, c3 = st.columns(3)
+c1.metric("Tables loaded", len(tables))
+c2.metric("Source rows", sum(raw_counts.values()))
+c3.metric("Unique keys", len(result))
+
+for w in all_warnings:
+    st.warning(w)
+
+conflicts = name_conflicts(tables)
+if not conflicts.empty:
+    st.warning(f"{len(conflicts)} key(s) have different 'Corp Tax Account' names across tables.")
+    with st.expander("View name conflicts"):
+        st.dataframe(conflicts, use_container_width=True)
+
+# Results
+st.subheader("Consolidated result")
+search = st.text_input("Filter by key or account name")
+view = result
+if search:
+    mask = result.astype(str).apply(lambda col: col.str.contains(search, case=False, na=False)).any(axis=1)
+    view = result[mask]
+st.dataframe(view, use_container_width=True, height=450)
+
+st.subheader("Column totals")
+total_cols = [c for c in result.columns if any(c.startswith(n) for n in NUM_COLS)]
+st.dataframe(result[total_cols].sum().to_frame("Total").style.format("{:,.2f}"), use_container_width=True)
+
+# Downloads
+sheets = {"Consolidated": result}
+for label, t in tables.items():
+    sheets[f"Src_{label}"] = t
+if not conflicts.empty:
+    sheets["Name Conflicts"] = conflicts
+
+d1, d2 = st.columns(2)
+d1.download_button(
+    "Download Excel (with source tabs)",
+    to_excel_bytes(sheets),
+    file_name="corptax_consolidated.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
+d2.download_button(
+    "Download CSV",
+    result.to_csv(index=False).encode("utf-8"),
+    file_name="corptax_consolidated.csv",
+    mime="text/csv",
+)
