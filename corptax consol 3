@@ -1,0 +1,409 @@
+"""
+Corptax Account Consolidator (Streamlit)
+
+Run:
+    pip install streamlit pandas openpyxl xlsxwriter python-calamine
+    streamlit run corptax_consolidator.py
+
+(python-calamine is optional but makes reading big Excel sheets much faster.)
+
+Upload several tables that share this structure (they can sit in the middle of
+a larger sheet):
+    Corptax Account Key (primary key), Corp Tax Account, ITD Balance Amount,
+    Book Reclass, Tax Adjustments, Amount as per Schedule L/Page 1
+
+Output layout:
+    Corptax Account Key | Corp Tax Account | [File 1: 4 columns] | [File 2: 4 columns] | ...
+"""
+
+import csv
+import io
+import os
+import re
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+from openpyxl import load_workbook
+from openpyxl.utils.cell import column_index_from_string, coordinate_from_string
+
+KEY = "Corptax Account Key"
+NAME = "Corp Tax Account"
+NUM_COLS = [
+    "ITD Balance Amount",
+    "Book Reclass",
+    "Tax Adjustments",
+    "Amount as per Schedule L/Page 1",
+]
+
+# Header matching ignores case, spaces and punctuation.
+ALIASES = {
+    "corptaxaccountkey": KEY,
+    "corptaxacctkey": KEY,
+    "corptaxaccount": NAME,
+    "corptaxacct": NAME,
+    "itdbalanceamount": NUM_COLS[0],
+    "itdbalance": NUM_COLS[0],
+    "bookreclass": NUM_COLS[1],
+    "taxadjustments": NUM_COLS[2],
+    "amountasperschedulelpage1": NUM_COLS[3],
+    "amountasperschedulel": NUM_COLS[3],
+}
+KEY_ALIASES = {k for k, v in ALIASES.items() if v == KEY}
+EXCEL_EXT = (".xlsx", ".xlsm", ".xls")
+
+
+def norm(s) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+
+# ----------------------------- reading -----------------------------
+@st.cache_data(show_spinner=False)
+def sheet_names(data: bytes, filename: str) -> list:
+    name = filename.lower()
+    if name.endswith((".xlsx", ".xlsm")):
+        wb = load_workbook(io.BytesIO(data), read_only=True)
+        names = wb.sheetnames
+        wb.close()
+        return names
+    if name.endswith(".xls"):
+        return pd.ExcelFile(io.BytesIO(data)).sheet_names
+    return []
+
+
+@st.cache_resource(show_spinner=False, max_entries=10)
+def read_grid(data: bytes, filename: str, sheet) -> pd.DataFrame:
+    """Whole sheet/CSV as a raw grid of strings. Cached, so changing the start
+    cell or labels never re-reads the file."""
+    if filename.lower().endswith(EXCEL_EXT):
+        for engine in ("calamine", None):  # calamine is much faster when installed
+            try:
+                return pd.read_excel(
+                    io.BytesIO(data), sheet_name=sheet or 0, header=None, dtype=str, engine=engine
+                )
+            except ImportError:
+                continue
+    text = data.decode("utf-8-sig", errors="replace")
+    rows = list(csv.reader(io.StringIO(text)))
+    width = max((len(r) for r in rows), default=0)
+    return pd.DataFrame([r + [None] * (width - len(r)) for r in rows]).replace({"": None})
+
+
+def _nonblank(s: pd.Series) -> np.ndarray:
+    return (s.notna() & s.astype(str).str.strip().ne("")).to_numpy()
+
+
+def _run_length(mask: np.ndarray) -> int:
+    """Length of the leading run of True values."""
+    return len(mask) if mask.all() else int(np.argmin(mask))
+
+
+def find_key_header(grid: pd.DataFrame):
+    """Vectorised scan (column by column) for the first 'Corptax Account Key' header."""
+    for j in range(grid.shape[1]):
+        col = grid.iloc[:, j].dropna().astype(str)
+        if col.empty:
+            continue
+        hit = col.str.lower().str.replace(r"[^a-z0-9]", "", regex=True).isin(KEY_ALIASES)
+        if hit.any():
+            return grid.index.get_loc(hit.idxmax()), j
+    return None
+
+
+def extract_table(grid: pd.DataFrame, start_cell: str = "") -> pd.DataFrame:
+    """Cut one table out of a bigger sheet.
+
+    start_cell: cell holding the 'Corptax Account Key' header (e.g. 'C14').
+    Blank = auto-detect. Table runs right until the first empty header cell
+    and down until the first row with an empty key.
+    """
+    start_cell = (start_cell or "").strip().upper()
+    if start_cell:
+        try:
+            col_letter, row_num = coordinate_from_string(start_cell)
+            r, c = row_num - 1, column_index_from_string(col_letter) - 1
+        except Exception:
+            raise ValueError(f"'{start_cell}' is not a valid cell reference (try something like C14).")
+        if r >= len(grid) or c >= grid.shape[1]:
+            raise ValueError(f"Cell {start_cell} is outside the data in this sheet.")
+        if ALIASES.get(norm(grid.iat[r, c])) != KEY:
+            raise ValueError(
+                f"Cell {start_cell} contains {grid.iat[r, c]!r}, expected the '{KEY}' header."
+            )
+    else:
+        pos = find_key_header(grid)
+        if pos is None:
+            raise ValueError(
+                f"Could not find a '{KEY}' header. Enter its cell (e.g. C14) in the sidebar."
+            )
+        r, c = pos
+
+    n_cols = _run_length(_nonblank(grid.iloc[r, c:]))
+    header = [str(h).strip() for h in grid.iloc[r, c : c + n_cols]]
+    n_rows = _run_length(_nonblank(grid.iloc[r + 1 :, c])) if r + 1 < len(grid) else 0
+
+    body = grid.iloc[r + 1 : r + 1 + n_rows, c : c + n_cols].copy()
+    body.columns = header
+    return body.reset_index(drop=True)
+
+
+# ----------------------------- cleaning -----------------------------
+def to_number(series: pd.Series) -> pd.Series:
+    """Fast path first; only the awkward values ('1,234.50', '(25)', '$5') get cleaned."""
+    if pd.api.types.is_numeric_dtype(series):
+        return series.fillna(0).astype(float)
+    out = pd.to_numeric(series, errors="coerce")
+    bad = out.isna() & series.notna()
+    if bad.any():
+        s = series[bad].astype(str).str.strip()
+        neg = s.str.match(r"^\(.*\)$")
+        vals = pd.to_numeric(s.str.replace(r"[,$()\s]", "", regex=True), errors="coerce")
+        out.loc[bad] = vals.where(~neg, -vals)
+    return out.fillna(0).astype(float)
+
+
+def prepare(df: pd.DataFrame, label: str):
+    warnings = []
+    df = df.rename(columns={c: ALIASES.get(norm(c), c) for c in df.columns})
+    if KEY not in df.columns:
+        raise ValueError(f"'{label}': column '{KEY}' not found. Found: {list(df.columns)}")
+
+    out = pd.DataFrame(
+        {KEY: df[KEY].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)}
+    )
+    if NAME in df.columns:
+        out[NAME] = df[NAME].astype(str).str.strip().replace({"nan": None, "": None})
+    else:
+        out[NAME] = None
+        warnings.append(f"{label}: '{NAME}' column missing")
+    for c in NUM_COLS:
+        if c in df.columns:
+            out[c] = to_number(df[c])
+        else:
+            out[c] = 0.0
+            warnings.append(f"{label}: '{c}' column missing, treated as 0")
+
+    out = out[~out[KEY].isin(["", "nan", "None"])]
+    dups = int(out[KEY].duplicated().sum())
+    if dups:
+        warnings.append(f"{label}: {dups} duplicate key row(s) found, amounts were summed")
+    agg = out.groupby(KEY, sort=False, as_index=False).agg(
+        {NAME: "first", **{c: "sum" for c in NUM_COLS}}
+    )
+    return agg, warnings
+
+
+@st.cache_data(show_spinner=False)
+def load_table(data: bytes, filename: str, sheet, start_cell: str, label: str):
+    grid = read_grid(data, filename, sheet)
+    raw = extract_table(grid, start_cell)
+    clean, warns = prepare(raw, label)
+    return clean, warns, len(raw)
+
+
+# ----------------------------- consolidating -----------------------------
+def consolidate(tables: dict):
+    """tables: label -> DataFrame(KEY, NAME, 4 amount cols).
+    Returns values (index=key, columns=MultiIndex[label, metric]), account names, conflicts."""
+    frames = {label: t.set_index(KEY) for label, t in tables.items()}
+    values = pd.concat({l: f[NUM_COLS] for l, f in frames.items()}, axis=1)
+    names = pd.concat({l: f[NAME] for l, f in frames.items()}, axis=1).astype(object)
+
+    account = names.bfill(axis=1).iloc[:, 0]
+    conflicts = names[names.nunique(axis=1) > 1]
+
+    nums = pd.to_numeric(values.index.to_series(), errors="coerce")
+    if nums.notna().all():
+        order = np.argsort(nums.to_numpy(), kind="stable")
+    else:
+        order = np.argsort(values.index.to_numpy().astype(str), kind="stable")
+    values, account = values.iloc[order], account.iloc[order]
+    values.index.name = KEY
+    return values, account, conflicts
+
+
+# ----------------------------- exporting -----------------------------
+def build_excel(values, account, labels, conflicts) -> bytes:
+    import xlsxwriter
+    from xlsxwriter.utility import xl_col_to_name
+
+    buf = io.BytesIO()
+    wb = xlsxwriter.Workbook(buf, {"in_memory": True})
+    ws = wb.add_worksheet("Consolidated")
+
+    head = wb.add_format(
+        {"bold": True, "align": "center", "valign": "vcenter", "border": 1,
+         "bg_color": "#D9E1F2", "text_wrap": True}
+    )
+    sub = wb.add_format(
+        {"bold": True, "align": "center", "valign": "vcenter", "border": 1,
+         "bg_color": "#EEF2FA", "text_wrap": True}
+    )
+    num = wb.add_format({"num_format": "#,##0.00;(#,##0.00)"})
+    tot = wb.add_format({"bold": True, "top": 1, "num_format": "#,##0.00;(#,##0.00)"})
+
+    ws.merge_range(0, 0, 1, 0, KEY, head)
+    ws.merge_range(0, 1, 1, 1, NAME, head)
+    for g, label in enumerate(labels):
+        c0 = 2 + 4 * g
+        ws.merge_range(0, c0, 0, c0 + 3, label, head)  # file name over its 4 columns
+        for k, metric in enumerate(NUM_COLS):
+            ws.write(1, c0 + k, metric, sub)
+
+    n, ncols = len(values), values.shape[1]
+    ws.write_column(2, 0, values.index.tolist())
+    ws.write_column(2, 1, [None if pd.isna(x) else x for x in account.tolist()])
+    for j in range(ncols):
+        col = [None if x != x else x for x in values.iloc[:, j].tolist()]  # NaN -> blank
+        ws.write_column(2, 2 + j, col, num)
+
+    if n:
+        total_row = 2 + n
+        ws.write(total_row, 0, "Total", tot)
+        ws.write_blank(total_row, 1, None, tot)
+        for j in range(ncols):
+            L = xl_col_to_name(2 + j)
+            ws.write_formula(
+                total_row, 2 + j, f"=SUM({L}3:{L}{2 + n})", tot, float(values.iloc[:, j].sum())
+            )
+        ws.autofilter(1, 0, 1 + n, 1 + ncols)
+
+    ws.set_column(0, 0, 22)
+    ws.set_column(1, 1, 34)
+    ws.set_column(2, 1 + ncols, 16)
+    ws.set_row(1, 32)
+    ws.freeze_panes(2, 2)
+
+    if len(conflicts):
+        w2 = wb.add_worksheet("Name Conflicts")
+        w2.write_row(0, 0, [KEY] + list(labels), head)
+        for i, (k, row) in enumerate(conflicts.iterrows(), start=1):
+            w2.write_row(i, 0, [k] + [None if pd.isna(v) else v for v in row.tolist()])
+        w2.set_column(0, len(labels), 28)
+
+    wb.close()
+    return buf.getvalue()
+
+
+def build_csv(values, account) -> bytes:
+    out = values.copy()
+    out.columns = [f"{l} | {m}" for l, m in out.columns]
+    out.insert(0, NAME, account.values)
+    return out.to_csv().encode("utf-8")
+
+
+# ----------------------------- UI -----------------------------
+st.set_page_config(page_title="Corptax Consolidator", layout="wide")
+st.title("Corptax Account Consolidator")
+st.caption(f"Combine tables keyed on **{KEY}** into one, with 4 columns per file.")
+
+files = st.file_uploader(
+    "Upload your tables (CSV or Excel)",
+    type=["csv", "xlsx", "xlsm", "xls"],
+    accept_multiple_files=True,
+)
+if not files:
+    st.info("Upload your files to begin.")
+    st.stop()
+
+sig = tuple(f.file_id for f in files)
+if st.session_state.get("sig") != sig:  # files changed -> drop old result
+    st.session_state.pop("out", None)
+    st.session_state["sig"] = sig
+
+# Settings live in a form, so nothing recomputes until you press the button.
+cfg = []
+with st.sidebar.form("settings"):
+    st.subheader("Table settings")
+    for f in files:
+        st.markdown(f"**{f.name}**")
+        label = st.text_input(
+            "Label (shown above its 4 columns)",
+            value=os.path.splitext(f.name)[0],
+            key=f"lbl_{f.file_id}",
+        )
+        sheet = None
+        names = sheet_names(f.getvalue(), f.name)
+        if len(names) > 1:
+            sheet = st.selectbox("Sheet", names, key=f"sh_{f.file_id}")
+        start = st.text_input(
+            "Start cell",
+            value="",
+            placeholder="e.g. C14 (blank = auto-detect)",
+            help=f"Cell holding the '{KEY}' header. Leave blank to auto-find it.",
+            key=f"st_{f.file_id}",
+        )
+        st.divider()
+        cfg.append((f, label.strip() or f.name, sheet, start))
+    run = st.form_submit_button("Consolidate", type="primary")
+
+if run:
+    try:
+        labels = [c[1] for c in cfg]
+        if len(set(labels)) != len(labels):
+            raise ValueError("Labels must be unique. Edit them in the sidebar.")
+        with st.spinner("Consolidating..."):
+            tables, warns, raw_counts = {}, [], {}
+            for f, label, sheet, start in cfg:
+                clean, w, nrows = load_table(f.getvalue(), f.name, sheet, start, label)
+                tables[label], raw_counts[label] = clean, nrows
+                warns += w
+            values, account, conflicts = consolidate(tables)
+            st.session_state["out"] = {
+                "values": values,
+                "account": account,
+                "conflicts": conflicts,
+                "labels": labels,
+                "warnings": warns,
+                "rows": sum(raw_counts.values()),
+                "excel": build_excel(values, account, labels, conflicts),
+                "csv": build_csv(values, account),
+            }
+    except Exception as e:
+        st.session_state.pop("out", None)
+        st.error(str(e))
+        st.stop()
+
+out = st.session_state.get("out")
+if out is None:
+    st.info("Set the label, sheet and start cell for each file in the sidebar, then press **Consolidate**.")
+    st.stop()
+
+values, account, conflicts = out["values"], out["account"], out["conflicts"]
+
+c1, c2, c3 = st.columns(3)
+c1.metric("Files", len(out["labels"]))
+c2.metric("Source rows", f"{out['rows']:,}")
+c3.metric("Unique keys", f"{len(values):,}")
+
+for w in out["warnings"]:
+    st.warning(w)
+if len(conflicts):
+    st.warning(f"{len(conflicts)} key(s) have different '{NAME}' names across files.")
+    with st.expander("View name conflicts"):
+        st.dataframe(conflicts, use_container_width=True)
+
+d1, d2, _ = st.columns([1, 1, 3])
+d1.download_button(
+    "Download Excel",
+    out["excel"],
+    file_name="corptax_consolidated.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
+d2.download_button("Download CSV", out["csv"], file_name="corptax_consolidated.csv", mime="text/csv")
+
+st.subheader("Consolidated result")
+search = st.text_input("Filter by key or account name")
+display = values.copy()
+display.index = pd.MultiIndex.from_arrays([values.index, account.values], names=[KEY, NAME])
+if search:
+    lvl0 = pd.Index(display.index.get_level_values(0).astype(str))
+    lvl1 = pd.Index(display.index.get_level_values(1).astype(str))
+    mask = lvl0.str.contains(search, case=False, regex=False) | lvl1.str.contains(
+        search, case=False, regex=False
+    )
+    display = display[np.asarray(mask)]
+st.dataframe(display, use_container_width=True, height=500)
+
+st.subheader("Totals by file")
+st.dataframe(values.sum().unstack().loc[out["labels"], NUM_COLS], use_container_width=True)
